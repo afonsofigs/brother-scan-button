@@ -1,0 +1,1404 @@
+#!/usr/bin/env python3
+"""brother-scan-button: the scan button on Brother scanners, configured with NAPS2.
+
+Brother's `brscan-skey` daemon notices a button press and runs
+`brother-scan-button scan --action <image|ocr|email|file> <device> ...`.
+Scan settings come from a NAPS2 profile. Pages are scanned with `scanimage`,
+so backend options such as Brother's AutoDocumentSize and AutoDeskew work,
+and saved with `naps2 console`.
+
+Commands: setup, scan, status, uninstall. See README.md.
+https://github.com/afonsofigs/brother-scan-button (MIT licence)
+"""
+
+import argparse
+import configparser
+import contextlib
+import datetime as dt
+import fcntl
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+VERSION = "0.1.0"
+APP = "brother-scan-button"
+
+HOME = Path.home()
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+XDG_CACHE = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache"))
+CONFIG_FILE = Path(os.environ.get("BSB_CONFIG", XDG_CONFIG / APP / "config.ini"))
+NAPS2_PROFILES = Path(os.environ.get("BSB_NAPS2_PROFILES", XDG_CONFIG / "naps2" / "profiles.xml"))
+LOG_FILE = Path(os.environ.get("BSB_LOG", XDG_CACHE / f"{APP}.log"))
+LOCK_FILE = Path(os.environ.get("BSB_LOCK", XDG_CACHE / f"{APP}.lock"))
+# Pages in progress. On disk rather than in /tmp, which is RAM on many systems
+# and is emptied at boot.
+WORK_ROOT = Path(os.environ.get("BSB_WORK", XDG_CACHE / APP / "work"))
+INSTALL_PATH = HOME / ".local" / "bin" / APP
+SERVICE_NAME = f"{APP}.service"
+SERVICE_FILE = XDG_CONFIG / "systemd" / "user" / SERVICE_NAME
+# gvfs FUSE mounts (Google Drive, SMB, SFTP...). Overridable for tests.
+REMOTE_PREFIX = os.environ.get("BSB_REMOTE_PREFIX", "/run/user/")
+
+SKEY_DIR = Path("/opt/brother/scanner/brscan-skey")
+SKEY_CONFIG = SKEY_DIR / "brscan-skey.config"
+SKEY_ORIG = Path(f"{SKEY_CONFIG}.orig")
+SKEY_EXE = SKEY_DIR / "brscan-skey-exe"
+SKEY_ACTIONS = ("IMAGE", "OCR", "EMAIL", "FILE")
+
+DEFAULT_PROFILE = "Scan Button"
+PREFERRED_BACKEND_OPTIONS = {"AutoDocumentSize": "yes", "AutoDeskew": "yes"}
+# A feeder that never reports "empty" must not fill the disk.
+SAFETY_MAX_PAGES = 500
+MAX_PAGES_LIMIT = 1000  # all pages go to NAPS2 in one argument, which Linux caps at 128 KiB
+# Set from the NAPS2 profile; in `options` they would break the page count.
+RESERVED_OPTIONS = {"source", "mode", "resolution", "x", "y", "l", "t", "format", "batch",
+                    "batch-count", "batch-start", "batch-increment", "d", "device-name"}
+
+TIMEOUT_SCAN = 30 * 60
+TIMEOUT_NAPS2 = 15 * 60
+TIMEOUT_GIO = 5 * 60
+TIMEOUT_QUICK = 60
+UPLOAD_BUDGET = 20 * 60  # all uploads of one press together
+LOCK_WAIT = 30 * 60
+
+PAGE_SIZES_MM = {  # NAPS2 PageSize names
+    "Letter": (215.9, 279.4), "Legal": (215.9, 355.6),
+    "A3": (297, 420), "A4": (210, 297), "A5": (148, 210),
+    "B4": (250, 353), "B5": (176, 250),
+}
+UNIT_MM = {"Inch": 25.4, "Centimetre": 10.0, "Millimetre": 1.0}
+FLATBED_RE = r"flatbed|platen|glass"
+FEEDER_RE = r"adf|feeder|automatic|document|duplex"
+END_OF_FEED_RE = r"out of documents|no docs|document feeder (is )?empty"
+
+
+def scan_end_reason(stderr):
+    """The line of scanimage's stderr that says why scanning stopped. Skips the
+    "rounded value" notices and the batch progress lines ("Scanning page 2",
+    "Scanned page 2. (scanner status = 7)", "Batch terminated, 2 pages scanned")."""
+    sane_errors = [l for l in stderr.splitlines() if re.search(r"sane_(start|read): ", l)]
+    if sane_errors:
+        return sane_errors[-1].strip()
+    lines = [l for l in stderr.strip().splitlines()
+             if l.strip() and "rounded value" not in l
+             and not re.search(r"batch terminated|^\s*scann(ing|ed) page", l, re.I)]
+    return lines[-1] if lines else ""
+
+
+class ScanError(Exception):
+    """The scan did not end with every page at its destination."""
+
+
+class Interrupted(BaseException):
+    """SIGTERM/SIGHUP, e.g. the service being stopped during a scan."""
+
+
+# --------------------------------------------------------------------------- utils
+
+def log(msg):
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+    except OSError as e:
+        print(f"{APP}: cannot write {LOG_FILE}: {e}\n{msg}", file=sys.stderr)
+
+
+def notify(title, body="", urgent=False):
+    if os.environ.get("BSB_NO_NOTIFY") or not shutil.which("notify-send"):
+        return
+    cmd = ["notify-send", "-a", "Scanner", "-i", "scanner"]
+    if urgent:
+        cmd += ["-u", "critical"]
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(cmd + [title, body], timeout=10, capture_output=True)
+
+
+def run(cmd, timeout=TIMEOUT_QUICK):
+    """Run a command in its own process group. On timeout or interruption the
+    group gets SIGTERM, then SIGKILL; a process stuck in the kernel (a hung FUSE
+    mount) is abandoned instead of waited for. A missing program is a ScanError."""
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             start_new_session=True)
+    except FileNotFoundError:
+        raise ScanError(f"'{cmd[0]}' is not installed or not on PATH") from None
+    try:
+        out, err = p.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+    except BaseException:
+        for sig, grace in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(p.pid, sig)
+            try:
+                p.communicate(timeout=grace)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        raise
+
+
+def documents_dir():
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        out = subprocess.run(["xdg-user-dir", "DOCUMENTS"], text=True, capture_output=True,
+                             timeout=10).stdout.strip()
+        if out and out != str(HOME):
+            return Path(out)
+    return HOME / "Documents"
+
+
+def tilde(path):
+    s, h = str(path), str(HOME)
+    return "~" + s[len(h):] if s == h or s.startswith(h + "/") else s
+
+
+def default_output_path():
+    return str(documents_dir() / "Scans" / "scan_$(YYYY)-$(MM)-$(DD)_$(hh)-$(mm)-$(ss).pdf")
+
+
+def is_remote(path):
+    return str(path).startswith(REMOTE_PREFIX)
+
+
+def gvfs_path(path):
+    """google-drive://user@host/<ids> as copied from Files -> its gvfs FUSE path."""
+    m = re.match(r"google-drive://([^@/]+)@([^/]+)(/.*)?$", path)
+    if not m:
+        return path
+    return f"/run/user/{os.getuid()}/gvfs/google-drive:host={m.group(2)},user={m.group(1)}{m.group(3) or '/'}"
+
+
+def child_ok(cmd, timeout=20):
+    """Exit status of a small command, False on timeout. os.path functions can
+    block for minutes on a dead gvfs mount, a child process can be abandoned."""
+    try:
+        return run(cmd, timeout=timeout).returncode == 0
+    except (subprocess.TimeoutExpired, ScanError):
+        return False
+
+
+def remote_isdir(path):
+    return child_ok(["test", "-d", path])
+
+
+def gvfs_mount_root(path):
+    """/run/user/<uid>/gvfs/<mount>: it exists only while the mount is up. Anything
+    created below it otherwise lands on /run/user, which lives in RAM."""
+    m = re.match(r"(/run/user/\d+/gvfs/[^/]+)", str(path))
+    return m.group(1) if m else None
+
+
+def folder_label(directory):
+    """What to call a destination folder in a notification."""
+    if is_remote(directory):
+        with contextlib.suppress(subprocess.TimeoutExpired, ScanError):
+            r = run(["gio", "info", "-a", "standard::display-name", directory], timeout=20)
+            m = re.search(r"standard::display-name: (.*)", r.stdout)
+            if r.returncode == 0 and m:
+                return m.group(1).strip()
+        return os.path.basename(directory)
+    return tilde(directory)
+
+
+@contextlib.contextmanager
+def scan_lock():
+    """One scan at a time: a second press waits for the first to finish saving."""
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_FILE.open("w") as f:
+        deadline = time.monotonic() + LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise ScanError("another scan has been running for too long") from None
+                time.sleep(1)
+        yield
+
+
+# ---------------------------------------------------------------------- settings
+
+def load_config():
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read_dict({
+        "general": {"profile": DEFAULT_PROFILE},
+        "scanner": {"options": "", "max_pages": "0"},
+        "output": {"jpeg_quality": "90", "ocr_lang": "",
+                   "fallback_dir": str(documents_dir() / "Scans" / "unsent")},
+    })
+    try:
+        cfg.read(str(CONFIG_FILE), encoding="utf-8")
+    except configparser.Error as e:
+        raise ScanError(f"{CONFIG_FILE}: {e}") from None
+    return cfg
+
+
+def config_int(cfg, section, key, lo=0, hi=None):
+    raw = cfg.get(section, key).strip()
+    if not re.fullmatch(r"\d+", raw) or int(raw) < lo or (hi is not None and int(raw) > hi):
+        limits = f"{lo}-{hi}" if hi is not None else f"{lo} or more"
+        raise ScanError(f"{CONFIG_FILE}: [{section}] {key} must be a whole number {limits}, got '{raw}'")
+    return int(raw)
+
+
+def validate_config(cfg):
+    config_int(cfg, "scanner", "max_pages", 0, MAX_PAGES_LIMIT)
+    config_int(cfg, "output", "jpeg_quality", 0, 100)
+    parse_option_string(cfg.get("scanner", "options"))
+
+
+def parse_option_string(s):
+    """'AutoDocumentSize=yes --AutoDeskew=yes' -> {'AutoDocumentSize': 'yes', 'AutoDeskew': 'yes'}"""
+    try:
+        tokens = shlex.split(s or "")
+    except ValueError as e:
+        raise ScanError(f"{CONFIG_FILE}: [scanner] options: {e}") from None
+    opts = {}
+    for tok in tokens:
+        name, _, value = tok.lstrip("-").partition("=")
+        if name:
+            opts[name] = value
+    return opts
+
+
+def profile_for_action(cfg, action):
+    return (cfg.get("general", f"profile_{action}", fallback="") if action else "") or cfg.get("general", "profile")
+
+
+def read_profile(name):
+    """Return the NAPS2 profile called `name` as a dict (defaults if not found)."""
+    p = {"found": False, "path": default_output_path(), "dpi": 300, "bitdepth": "C24Bit",
+         "source": "Feeder", "pagesize": None, "custom_mm": None, "separator": "FilePerScan",
+         "rotate": 0.0, "deskew": False, "options": {}}
+    try:
+        root = ET.parse(NAPS2_PROFILES).getroot()
+    except (OSError, ET.ParseError):
+        return p
+    for prof in root.findall("ScanProfile"):
+        if prof.findtext("DisplayName") != name:
+            continue
+        p["found"] = True
+        if prof.findtext("EnableAutoSave") == "true" and prof.findtext("AutoSaveSettings/FilePath"):
+            p["path"] = prof.findtext("AutoSaveSettings/FilePath")
+            p["separator"] = prof.findtext("AutoSaveSettings/Separator") or p["separator"]
+        m = re.fullmatch(r"Dpi(\d+)", prof.findtext("Resolution") or "")
+        if m:
+            p["dpi"] = int(m.group(1))
+        p["bitdepth"] = prof.findtext("BitDepth") or p["bitdepth"]
+        p["source"] = prof.findtext("PaperSource") or p["source"]
+        p["pagesize"] = prof.findtext("PageSize")
+        if p["pagesize"] == "Custom":
+            with contextlib.suppress(TypeError, ValueError):
+                unit = UNIT_MM.get(prof.findtext("CustomPageSize/Unit") or "Inch", 25.4)
+                p["custom_mm"] = (float(prof.findtext("CustomPageSize/Width")) * unit,
+                                  float(prof.findtext("CustomPageSize/Height")) * unit)
+        with contextlib.suppress(ValueError):
+            p["rotate"] = float(prof.findtext("RotateDegrees") or 0)
+        p["deskew"] = prof.findtext("AutoDeskew") == "true"
+        for opt in prof.findall("KeyValueOptions/Option"):
+            if opt.get("name"):
+                p["options"][opt.get("name")] = opt.text or ""
+        break
+    return p
+
+
+def strip_default(rest):
+    """Remove trailing "[default]", "[advanced]", "[inactive]" groups from a `scanimage -A` line.
+    Defaults can contain brackets themselves, e.g. "[24bit Color[Fast]]"."""
+    rest = rest.rstrip()
+    while rest.endswith("]"):
+        depth = 0
+        for i in range(len(rest) - 1, -1, -1):
+            depth += {"]": 1, "[": -1}.get(rest[i], 0)
+            if depth == 0:
+                break
+        if i == 0 or rest[i - 1] != " ":
+            break  # the bracket belongs to a value
+        rest = rest[:i].rstrip()
+    return rest
+
+
+def parse_device_options(out):
+    """Parse `scanimage -A` output into {name: [allowed values] | (min, max) | []}."""
+    opts = {}
+    for line in out.splitlines():
+        m = re.match(r"\s+(?:--([\w-]+)|-([lxyt]))\b(\[=\()?\s*(.*)", line)
+        if not m:
+            continue
+        name, is_bool, rest = m.group(1) or m.group(2), m.group(3), strip_default(m.group(4))
+        if is_bool:  # --Name[=(yes|no)]
+            rest = rest.removesuffix(")]")
+        rng = re.match(r"(-?[\d.]+)\.\.(-?[\d.]+)", rest)
+        if rng:
+            opts[name] = (float(rng.group(1)), float(rng.group(2)))
+        elif rest:
+            opts[name] = rest.split("|")
+        else:
+            opts[name] = []
+    return opts
+
+
+def device_options(device):
+    try:
+        r = run(["scanimage", "-d", device, "-A"])
+    except subprocess.TimeoutExpired:
+        raise ScanError(f"the scanner {device} did not answer") from None
+    opts = parse_device_options(r.stdout)
+    if r.returncode != 0 or not opts:
+        detail = (r.stderr or "").strip().splitlines()[-1:] or ["no options listed"]
+        raise ScanError(f"could not read the options of {device}: {detail[0]}")
+    return opts
+
+
+def pick_mode(modes, bitdepth):
+    if not modes or isinstance(modes, tuple):
+        return None
+    want = {"C24Bit": "color", "Grayscale": "gray", "BlackAndWhite": "bw"}.get(bitdepth, "color")
+    kinds = {
+        "color": lambda m: re.search(r"colou?r", m, re.I),
+        "gray": lambda m: re.search(r"gr[ae]y", m, re.I),
+        "bw": lambda m: re.search(r"lineart|black|binary|b\s*&\s*w|halftone", m, re.I),
+    }
+    matches = [m for m in modes if kinds[want](m)]
+    # true grey/colour before dithered variants
+    matches.sort(key=lambda m: bool(re.search(r"diffusion|dither|halftone", m, re.I)))
+    return matches[0] if matches else None
+
+
+def pick_source(sources, source):
+    if not sources or isinstance(sources, tuple):
+        return None
+    patterns = {"Glass": FLATBED_RE, "Feeder": r"adf|feeder|automatic|document", "Duplex": r"duplex"}
+    matches = [s for s in sources if re.search(patterns.get(source, patterns["Feeder"]), s, re.I)]
+    if source == "Feeder":
+        matches = [s for s in matches if not re.search("duplex", s, re.I)] or matches
+    return matches[0] if matches else None
+
+
+def choose_source(sources, wanted):
+    """The profile's source, or the closest one the device has."""
+    for candidate in (wanted, "Feeder", "Glass", "Duplex"):
+        s = pick_source(sources, candidate)
+        if s:
+            if candidate != wanted:
+                log(f"profile asks for {wanted}, scanner has {sources}; using '{s}'")
+            return s
+    return None
+
+
+def pick_resolution(values, dpi):
+    if isinstance(values, tuple):
+        lo, hi = values
+        return int(min(max(dpi, lo), hi))
+    nums = [int(n) for n in (re.sub(r"\D", "", str(v).split(".")[0]) for v in values or []) if n]
+    return min(nums, key=lambda v: abs(v - dpi)) if nums else dpi
+
+
+# ------------------------------------------------------------------ file names
+
+def expand_date(pattern, now):
+    s = pattern
+    for key, fmt in (("YYYY", "%Y"), ("YY", "%y"), ("MM", "%m"), ("DD", "%d"),
+                     ("hh", "%H"), ("mm", "%M"), ("ss", "%S")):
+        s = s.replace(f"$({key})", now.strftime(fmt))
+    return s
+
+
+def resolve_target(pattern, now=None):
+    """Profile path -> absolute path with dates filled in. The $(n...) counter stays;
+    it is resolved against the destination folder when the files are placed."""
+    s = expand_date(gvfs_path(os.path.expanduser(pattern)), now or dt.datetime.now())
+    directory, name = os.path.split(s)
+    directory = re.sub(r"\$\(n+\)", "1", directory)
+    if not os.path.isabs(directory):
+        directory = str(documents_dir() / "Scans" / directory)
+    return os.path.join(directory, name)
+
+
+def final_names(name, suffixes, existing):
+    """Names for NAPS2's output files (`suffixes` like "", ".1", ".2"), none of them in
+    `existing` (case-folded names already in the folder). Mirrors NAPS2: a $(n...)
+    counter takes the next free number, other names get " (2)", " (3)"..."""
+    stem, ext = os.path.splitext(name)
+    m = re.search(r"\$\((n+)\)", stem)
+    if m:
+        i = 1
+        while True:
+            s = stem.replace(m.group(0), str(i).zfill(len(m.group(1))), 1)
+            names = [s + suf + ext for suf in suffixes]
+            prefix = (s + ".").casefold()
+            if not any(n.casefold() in existing for n in names) and not any(e.startswith(prefix) for e in existing):
+                return names
+            i += 1
+    names = []
+    for suf in suffixes:
+        n = unique_name(existing, stem + suf + ext)
+        existing.add(n.casefold())
+        names.append(n)
+    return names
+
+
+def unique_name(existing, name):
+    stem, ext = os.path.splitext(name)
+    candidate, i = name, 2
+    while candidate.casefold() in existing:
+        candidate = f"{stem} ({i}){ext}"
+        i += 1
+    return candidate
+
+
+def remote_names(directory):
+    """Case-folded file names in a gvfs folder, or None if they can't be read.
+    Google Drive lists entries by id; the display name is what users see and
+    what `gio copy` targets."""
+    try:
+        r = run(["gio", "list", "-a", "standard::display-name", directory], timeout=TIMEOUT_QUICK)
+    except (subprocess.TimeoutExpired, ScanError):
+        return None
+    if r.returncode != 0:
+        return None
+    names = set()
+    for line in r.stdout.splitlines():
+        m = re.search(r"standard::display-name=(.*)$", line)
+        names.add((m.group(1) if m else line.split("\t")[0]).casefold())
+    return names
+
+
+# --------------------------------------------------------------------- scanning
+
+def scanimage_args(device, prof, cfg):
+    """Build the scanimage command. Returns (args, batch_count)."""
+    dev_opts = device_options(device)
+    args = ["scanimage", "-d", device, "--format=png"]
+
+    mode = pick_mode(dev_opts.get("mode"), prof["bitdepth"])
+    if mode:
+        args += ["--mode", mode]
+    args += ["--resolution", str(pick_resolution(dev_opts.get("resolution"), prof["dpi"]))]
+    source = choose_source(dev_opts.get("source"), prof["source"])
+    if source:
+        args += ["--source", source]
+
+    backend = parse_option_string(cfg.get("scanner", "options"))
+    backend.update(prof["options"])  # the profile wins
+    applied = {}
+    for name, value in backend.items():
+        if name in RESERVED_OPTIONS:
+            log(f"option --{name} is set from the NAPS2 profile; ignored in options")
+        elif name in dev_opts:
+            args.append(f"--{name}={value}" if value != "" else f"--{name}")
+            applied[name] = value
+        else:
+            log(f"option --{name} is not supported by {device}, ignored")
+
+    auto_size = applied.get("AutoDocumentSize", "").lower() in ("yes", "true", "1")
+    size = prof["custom_mm"] or PAGE_SIZES_MM.get(prof["pagesize"] or "")
+    x, y = dev_opts.get("x"), dev_opts.get("y")
+    if size and not auto_size and isinstance(x, tuple) and isinstance(y, tuple):
+        args += ["-x", f"{min(size[0], x[1]):.1f}", "-y", f"{min(size[1], y[1]):.1f}"]
+
+    max_pages = config_int(cfg, "scanner", "max_pages", 0, MAX_PAGES_LIMIT)
+    if source and re.search(FEEDER_RE, source, re.I) and not re.search(FLATBED_RE, source, re.I):
+        batch_count = max_pages or SAFETY_MAX_PAGES
+    elif source is None and max_pages:
+        batch_count = max_pages  # no source option: the user says it's a feeder
+    else:
+        batch_count = 1
+    return args, batch_count
+
+
+def work_root():
+    # ';' separates naps2 -i paths, '%' is a scanimage format, '[' is NAPS2 slice notation
+    if re.search(r"[;%\[]", str(WORK_ROOT)):
+        return Path(tempfile.gettempdir()) / f"{APP}-{os.getuid()}"
+    return WORK_ROOT
+
+
+def new_work_dir():
+    root = work_root()
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="scan-", dir=root))
+
+
+def recover_orphans(cfg):
+    """Rescue pages left by a scan that was killed, and tell the user at once."""
+    root = work_root()
+    if not root.is_dir():
+        return
+    for d in sorted(root.glob("scan-*")):
+        files = list(d.rglob("*"))
+        if any(time.time() - f.stat().st_mtime < 120 for f in files if f.exists()):
+            continue  # still being written, e.g. by a scanimage whose parent was killed
+        pages = sorted(d.glob("page-*.png"))
+        if pages:
+            where = rescue_pages(pages, cfg, "interrupted")
+            if not where:
+                log(f"could not recover the pages in {d}; they stay there")
+                continue
+            log(f"RECOVERED {len(pages)} page(s) from {d} to {where}")
+            notify("Scanner", f"Pages of an interrupted scan were recovered to {tilde(where)}", urgent=True)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def rescue_pages(pages, cfg, label="pages"):
+    """Copy raw pages into a new folder somewhere lasting. Returns the folder, or None."""
+    stamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    for base in (os.path.expanduser(cfg.get("output", "fallback_dir")), str(HOME / f"{APP}-rescue")):
+        for i in range(1, 1000):
+            folder = os.path.join(base, f"{label}_{stamp}" + (f"_{i}" if i > 1 else ""))
+            try:
+                os.makedirs(folder)
+                break
+            except FileExistsError:
+                continue
+            except OSError:
+                folder = None
+                break
+        else:
+            folder = None
+        if folder is None:
+            continue
+        try:
+            for p in pages:
+                shutil.copy2(p, folder)
+                with open(os.path.join(folder, p.name), "rb") as f:
+                    os.fsync(f.fileno())
+            return folder
+        except OSError:
+            continue
+    return None
+
+
+def scan(device, action=None, dry_run=False):
+    """Scan and save. Returns (delivered, kept, warnings): files at the destination,
+    files kept in the fallback folder, and problems to report. Raises ScanError."""
+    cfg = load_config()
+    validate_config(cfg)  # before scanning, not after
+    warnings = []
+    if not dry_run:
+        recover_orphans(cfg)
+    profile_name = profile_for_action(cfg, action)
+    prof = read_profile(profile_name)
+    if not prof["found"]:
+        warnings.append(f"NAPS2 profile '{profile_name}' not found; default settings were used")
+    target = resolve_target(prof["path"])
+
+    args, batch_count = scanimage_args(device, prof, cfg)
+    work = new_work_dir()
+    args += [f"--batch={work}/page-%04d.png", f"--batch-count={batch_count}"]
+    if dry_run:
+        shutil.rmtree(work, ignore_errors=True)
+        print(shlex.join(args))
+        print(f"target: {target}")
+        return [], [], warnings
+
+    delivered, kept = [], []
+    try:
+        try:
+            res = run(args, timeout=TIMEOUT_SCAN)
+            stderr, failed = res.stderr or "", res.returncode != 0
+        except subprocess.TimeoutExpired as e:
+            stderr, failed = f"scanimage timed out after {e.timeout} s", True
+        pages = sorted(p for p in work.glob("page-*.png") if p.stat().st_size > 0)
+        reason = scan_end_reason(stderr)
+        if not pages:
+            if re.search(END_OF_FEED_RE, reason, re.I):
+                reason = "no paper in the scanner"
+            elif re.search("jammed", reason, re.I):
+                reason = "paper jam, or no paper in the scanner"
+            raise ScanError(f"scan failed on {device}: {reason or 'no pages scanned'}")
+        if failed and not re.search(END_OF_FEED_RE, reason, re.I):
+            warnings.append(f"scanning stopped early ({reason or 'no reason given'}); saved {len(pages)} page(s)")
+            log("scanimage said: " + " | ".join(stderr.strip().splitlines()[-4:]))
+        if batch_count == SAFETY_MAX_PAGES and len(pages) >= batch_count:
+            warnings.append(f"stopped at the safety limit of {SAFETY_MAX_PAGES} pages (max_pages in config.ini)")
+        log(f"scanned {len(pages)} page(s) on {device} [{profile_name}]")
+
+        save(pages, prof, cfg, work, target, delivered, kept, warnings)
+        if kept:
+            warnings.append(f"{len(kept)} file(s) could not be delivered and were kept in "
+                            f"{tilde(os.path.dirname(kept[0]))}")
+        return delivered, kept, warnings
+    except (Exception, Interrupted, KeyboardInterrupt) as e:
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):  # finish the rescue first
+            signal.signal(sig, signal.SIG_IGN)
+        pages = sorted(p for p in work.glob("page-*.png") if p.stat().st_size > 0)
+        if isinstance(e, ScanError) and not delivered and not kept and not pages:
+            raise
+        detail = "the scan was interrupted" if isinstance(e, (Interrupted, KeyboardInterrupt)) else (
+            str(e) if isinstance(e, ScanError) else f"{type(e).__name__}: {e}")
+        if delivered:
+            detail += f"; already saved: {', '.join(delivered)}"
+        if kept:
+            detail += f"; kept: {', '.join(kept)}"
+        if pages:
+            where = rescue_pages(pages, cfg)
+            if where is None:
+                where = str(work)
+                work = None  # it holds the only copy
+            detail += f". The scanned pages were kept in {tilde(where)}"
+        raise ScanError(detail) from e
+    finally:
+        if work is not None:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def save(pages, prof, cfg, work, target, delivered, kept, warnings):
+    """Write the pages with NAPS2 and deliver them. Appends to `delivered` and `kept`
+    (the fallback folder) as files are placed."""
+    dest_dir, name = os.path.split(target)
+    ext = os.path.splitext(name)[1]
+    out_dir = work / "out"
+    out_dir.mkdir()
+    cmd = ["naps2", "console", "-n", "0", "-i", ";".join(map(str, pages)),
+           "-o", str(out_dir / f"scan{ext}"), "--jpegquality", cfg.get("output", "jpeg_quality")]
+    if prof["separator"] == "FilePerPage" and len(pages) > 1:
+        cmd.append("--split")
+    if prof["rotate"]:
+        cmd += ["--rotate", str(int(prof["rotate"]))]
+    if prof["deskew"]:
+        cmd.append("--deskew")
+    ocr = bool(cfg.get("output", "ocr_lang")) and ext.lower() == ".pdf"
+    if ocr:
+        cmd += ["--ocrlang", cfg.get("output", "ocr_lang")]
+    try:
+        res = run(cmd, timeout=TIMEOUT_NAPS2 + (60 * len(pages) if ocr else 0))
+    except subprocess.TimeoutExpired:
+        raise ScanError("NAPS2 did not finish saving in time") from None
+    output = f"{res.stdout}\n{res.stderr}"
+    files = sorted(out_dir.iterdir(), key=lambda f: [int(n) if n.isdigit() else n for n in re.split(r"(\d+)", f.name)])
+    if res.returncode != 0 or not files:
+        raise ScanError(f"NAPS2 could not save the scan: {output.strip()[:300]}")
+    if re.search(r"error occurred running OCR", output, re.I):
+        warnings.append(f"OCR failed (is the '{cfg.get('output', 'ocr_lang')}' language installed?); "
+                        "saved without text")
+    suffixes = [f.name[len("scan"):-len(ext) or None] for f in files]
+
+    if is_remote(dest_dir):
+        deliver_remote(files, suffixes, name, dest_dir, cfg, delivered, kept)
+        return
+    os.makedirs(dest_dir, exist_ok=True)
+    existing = {n.casefold() for n in os.listdir(dest_dir)}
+    for f, final in zip(files, final_names(name, suffixes, existing)):
+        delivered.append(place_local(f, dest_dir, final))
+
+
+def place_local(src, dest_dir, name):
+    """Copy without ever replacing an existing file (exclusive create)."""
+    stem, ext = os.path.splitext(name)
+    i = 1
+    while True:
+        dest = os.path.join(dest_dir, name if i == 1 else f"{stem} ({i}){ext}")
+        try:
+            with open(src, "rb") as fin, open(dest, "xb") as fout:
+                try:
+                    shutil.copyfileobj(fin, fout)
+                    fout.flush()
+                    os.fsync(fout.fileno())
+                except BaseException:
+                    fout.close()
+                    os.unlink(dest)
+                    raise
+            os.unlink(src)
+            return dest
+        except FileExistsError:
+            i += 1
+
+
+def deliver_remote(files, suffixes, name, dest_dir, cfg, delivered, kept):
+    root = gvfs_mount_root(dest_dir)
+    if root and not remote_isdir(root):
+        remount(dest_dir)
+    if root and not remote_isdir(root):
+        log(f"{root} is not mounted; keeping the files locally")
+        existing = None
+    else:
+        if not remote_isdir(dest_dir):
+            child_ok(["gio", "mkdir", "-p", dest_dir], timeout=TIMEOUT_QUICK)
+        existing = remote_names(dest_dir) if remote_isdir(dest_dir) else None
+        if existing is None:
+            log(f"cannot list {dest_dir}; keeping the files locally so nothing is overwritten")
+    if existing is None:
+        fb = fallback_dir(cfg)
+        taken = {n.casefold() for n in os.listdir(fb)}
+        for f, final in zip(files, final_names(name, suffixes, taken)):
+            kept.append(place_local(f, fb, final))
+        return
+    deadline = time.monotonic() + UPLOAD_BUDGET
+    tries = 3
+    for f, final in zip(files, final_names(name, suffixes, existing)):
+        dest = os.path.join(dest_dir, final)
+        if time.monotonic() < deadline and upload(f, dest, tries, deadline):
+            delivered.append(dest)
+        else:
+            kept.append(place_local(f, fallback_dir(cfg), final))
+            tries = 1  # the destination is struggling: don't spend minutes on every file
+
+
+def fallback_dir(cfg):
+    fb = os.path.expanduser(cfg.get("output", "fallback_dir"))
+    os.makedirs(fb, exist_ok=True)
+    return fb
+
+
+def remount(dest_dir):
+    """Mount a Google Drive account again (its gvfs mount drops now and then).
+    Only the account root: a sub-folder URI makes GNOME add one more mount."""
+    m = re.match(r"/run/user/\d+/gvfs/google-drive:([^/]+)", dest_dir)
+    if not m:
+        return
+    spec = dict(kv.split("=", 1) for kv in m.group(1).split(",") if "=" in kv)
+    if "user" in spec and "host" in spec:
+        child_ok(["gio", "mount", f"google-drive://{spec['user']}@{spec['host']}/"], timeout=TIMEOUT_QUICK)
+        time.sleep(2)
+
+
+def upload(src, dest, tries, deadline):
+    """gio copy replaces an existing file, so the name is checked right before each copy."""
+    dest_dir = os.path.dirname(dest)
+    for attempt in range(tries):
+        if time.monotonic() > deadline:
+            break
+        if not remote_isdir(dest_dir):
+            remount(dest_dir)
+        try:
+            exists = run(["test", "-e", dest], timeout=20).returncode == 0
+        except (subprocess.TimeoutExpired, ScanError):
+            log(f"could not check whether {dest} exists; not risking an overwrite")
+            return False
+        if exists:
+            log(f"{dest} exists; not overwriting it")
+            return False
+        try:
+            res = run(["gio", "copy", str(src), dest], timeout=TIMEOUT_GIO)
+            if res.returncode == 0:
+                return True
+            log(f"upload of {os.path.basename(dest)} failed: {res.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            log(f"upload of {os.path.basename(dest)} timed out")
+        if attempt + 1 < tries:
+            time.sleep(3)
+    return False
+
+
+def find_device():
+    """The first Brother scanner SANE knows about."""
+    try:
+        out = run(["scanimage", "-f", "%d\n"]).stdout.split()
+    except (subprocess.TimeoutExpired, ScanError):
+        return None
+    return next((d for d in out if d.startswith("brother")), None)
+
+
+def raise_interrupted(signum, frame):
+    raise Interrupted()
+
+
+def cmd_scan(a):
+    if a.dry_run:
+        try:
+            device = a.device or find_device()
+            if not device:
+                raise ScanError("no Brother scanner found (is it on and plugged in?)")
+            _, _, warnings = scan(device, a.action, dry_run=True)
+            for w in warnings:
+                print(f"warning: {w}", file=sys.stderr)
+            return 0
+        except ScanError as e:
+            print(e, file=sys.stderr)
+            return 1
+    log(f"scan requested (action={a.action or '-'}, device={a.device or 'auto'})")
+    signal.signal(signal.SIGTERM, raise_interrupted)
+    signal.signal(signal.SIGHUP, raise_interrupted)
+    try:
+        with scan_lock():
+            device = a.device or find_device()
+            if not device:
+                raise ScanError("no Brother scanner found (is it on and plugged in?)")
+            delivered, kept, warnings = scan(device, a.action)
+    except ScanError as e:
+        log(f"FAILED: {e}")
+        notify("Scan failed", str(e), urgent=True)
+        print(e, file=sys.stderr)
+        return 1
+    except (Interrupted, KeyboardInterrupt):
+        log("FAILED: interrupted before scanning")
+        return 1
+    except Exception as e:  # a press must never fail silently
+        log(f"FAILED: unexpected {type(e).__name__}: {e}\n{traceback.format_exc()}")
+        notify("Scan failed", f"{type(e).__name__}: {e}", urgent=True)
+        raise
+    for f in delivered:
+        log(f"OK {f}")
+    for f in kept:
+        log(f"KEPT {f}")
+    files = delivered + kept
+    for f in files:
+        print(f)
+    for w in warnings:
+        log(f"WARNING: {w}")
+    if files:
+        by_dir = {}
+        for f in files:
+            by_dir.setdefault(os.path.dirname(f), []).append(os.path.basename(f))
+        body = "\n".join(f"{', '.join(names)}\nin {folder_label(d)}" for d, names in by_dir.items())
+        if warnings:
+            notify("Scan saved with problems", "\n".join(warnings) + "\n\n" + body, urgent=True)
+        else:
+            notify("Scan saved", body)
+    return 0
+
+
+# ------------------------------------------------------------------------ setup
+
+def xml_escape(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def profile_xml(name, output_path, device_id, device_name, options, source="Feeder", pagesize="A4"):
+    kv = "".join(f'\n      <Option name="{xml_escape(n)}">{xml_escape(v)}</Option>'
+                 for n, v in options.items())
+    kv_block = f"\n    <KeyValueOptions>{kv}\n    </KeyValueOptions>" if options else ""
+    return f"""  <ScanProfile>
+    <Version>2</Version>
+    <Device>
+      <ID>{xml_escape(device_id)}</ID>
+      <Name>{xml_escape(device_name)}</Name>
+    </Device>
+    <DriverName>sane</DriverName>
+    <DisplayName>{xml_escape(name)}</DisplayName>
+    <IconID>0</IconID>
+    <MaxQuality>false</MaxQuality>
+    <IsDefault>false</IsDefault>
+    <UseNativeUI>false</UseNativeUI>
+    <AfterScanScale>OneToOne</AfterScanScale>
+    <Brightness>0</Brightness>
+    <Contrast>0</Contrast>
+    <BitDepth>C24Bit</BitDepth>
+    <PageAlign>Right</PageAlign>
+    <PageSize>{xml_escape(pagesize)}</PageSize>
+    <Resolution>Dpi300</Resolution>
+    <PaperSource>{xml_escape(source)}</PaperSource>
+    <EnableAutoSave>true</EnableAutoSave>
+    <AutoSaveSettings>
+      <FilePath>{xml_escape(output_path)}</FilePath>
+      <PromptForFilePath>false</PromptForFilePath>
+      <ClearImagesAfterSaving>false</ClearImagesAfterSaving>
+      <Separator>FilePerScan</Separator>
+    </AutoSaveSettings>
+    <Quality>90</Quality>
+    <AutoDeskew>false</AutoDeskew>
+    <RotateDegrees>0</RotateDegrees>
+    <ExcludeBlankPages>false</ExcludeBlankPages>
+    <BlankPageWhiteThreshold>70</BlankPageWhiteThreshold>
+    <BlankPageCoverageThreshold>25</BlankPageCoverageThreshold>{kv_block}
+  </ScanProfile>
+"""
+
+
+def add_profile_to_xml(text, block):
+    """Insert a <ScanProfile> block into the text of a NAPS2 profiles.xml."""
+    if "</ArrayOfScanProfile>" in text:
+        return text.replace("</ArrayOfScanProfile>", block + "</ArrayOfScanProfile>", 1)
+    m = re.search(r"<ArrayOfScanProfile\b([^>]*?)\s*/>", text)
+    if m:
+        return text[:m.start()] + f"<ArrayOfScanProfile{m.group(1)}>\n{block}</ArrayOfScanProfile>" + text[m.end():]
+    return None
+
+
+def write_atomic(path, text):
+    tmp = Path(f"{path}.{APP}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def local_paper_size(locale_output=None):
+    """Letter where the locale uses it (LC_PAPER height 279 mm), A4 elsewhere."""
+    if locale_output is None:
+        try:
+            locale_output = subprocess.run(["locale", "-k", "LC_PAPER"], text=True, capture_output=True,
+                                           timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            locale_output = ""
+    m = re.search(r"height=(\d+)", locale_output)
+    return "Letter" if m and m.group(1) == "279" else "A4"
+
+
+def ensure_profile(name, device, source):
+    if read_profile(name)["found"]:
+        print(f"  NAPS2 profile '{name}' already exists, left as is")
+        return True
+    if subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", "naps2"], capture_output=True).returncode == 0:
+        print("NAPS2 is open. Close it and run setup again, because NAPS2 overwrites the profile list when it exits.")
+        return False
+    block = profile_xml(name, default_output_path(), device, device.split(":")[0], {}, source, local_paper_size())
+    NAPS2_PROFILES.parent.mkdir(parents=True, exist_ok=True)
+    if NAPS2_PROFILES.exists():
+        old = NAPS2_PROFILES.read_text(encoding="utf-8-sig")
+        new = add_profile_to_xml(old, block)
+        if new is None:
+            print(f"Cannot add a profile to {NAPS2_PROFILES}: unexpected format. Create '{name}' in NAPS2 instead.")
+            return False
+        shutil.copy2(NAPS2_PROFILES, f"{NAPS2_PROFILES}.bak")
+    else:
+        new = ('<?xml version="1.0" encoding="utf-8"?>\n<ArrayOfScanProfile xmlns:xsi="http://www.w3.org/'
+               '2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">\n'
+               + block + "</ArrayOfScanProfile>\n")
+    write_atomic(NAPS2_PROFILES, new)
+    print(f"  created NAPS2 profile '{name}' -> {tilde(default_output_path())}")
+    return True
+
+
+def rewrite_skey_config(text, command):
+    """Point every brscan-skey action at `command(action)`, keeping other lines."""
+    for act in SKEY_ACTIONS:
+        line = f'{act}="{command(act)}"'
+        if re.search(rf"^{act}=", text, re.M):
+            text = re.sub(rf"^{act}=.*$", lambda _: line, text, flags=re.M)
+        else:
+            text = text.rstrip("\n") + ("\n" if text.strip() else "") + line + "\n"
+    return text
+
+
+def skey_points_here(text):
+    cmd = re.escape(shlex.quote(str(INSTALL_PATH)))
+    return all(re.search(rf'^{act}="{cmd} ', text, re.M) for act in SKEY_ACTIONS)
+
+
+def skey_other_users(text):
+    """Copies of this tool, installed by someone else, that brscan-skey.config points at."""
+    found = set()
+    for m in re.finditer(r'^[A-Z]+="(.*)"\s*$', text, re.M):
+        with contextlib.suppress(ValueError):
+            argv = shlex.split(m.group(1))
+            if argv and argv[0].endswith(f"/.local/bin/{APP}"):
+                found.add(argv[0])
+    return sorted(p for p in found if p != str(INSTALL_PATH))
+
+
+def skey_command(action):
+    return f"{shlex.quote(str(INSTALL_PATH))} scan --action {action.lower()}"
+
+
+CONFIG_TEMPLATE = """[general]
+# NAPS2 profile used by the button
+profile = {profile}
+# Scanners with a "Scan to" menu can use a profile per function
+# profile_image =
+# profile_ocr =
+# profile_email =
+# profile_file =
+
+[scanner]
+# Any option listed by `scanimage -d <device> -A`
+options = {options}
+# Pages per press with a feeder; 0 means until empty, capped at 500
+max_pages = 0
+
+[output]
+jpeg_quality = 90
+# OCR language for PDFs, e.g. eng. Install it first: naps2 console --install ocr-eng
+ocr_lang =
+# Where scans go when the destination can't be reached
+fallback_dir = {fallback}
+"""
+
+
+def set_config_profile(text, profile):
+    """Set `profile =` in [general], adding the key or the section if needed."""
+    line = f"profile = {profile}"
+    new, n = re.subn(r"^[ \t]*profile[ \t]*[=:].*$", lambda _: line, text, count=1, flags=re.M | re.I)
+    if n:
+        return new
+    if re.search(r"^\[general\]\s*$", text, re.M):
+        return re.sub(r"^\[general\]\s*$", lambda _: f"[general]\n{line}", text, count=1, flags=re.M)
+    return f"[general]\n{line}\n\n{text}"
+
+
+def listeners():
+    """Running brscan-skey-exe processes of any user: [(pid, uid, unit or scope, system)]."""
+    r = subprocess.run(["pgrep", "-x", "brscan-skey-exe"], text=True, capture_output=True)
+    result = []
+    for pid in r.stdout.split():
+        uid, unit, system = -1, "unknown", False
+        with contextlib.suppress(OSError, ValueError, IndexError, AttributeError):
+            status = Path(f"/proc/{pid}/status").read_text()
+            uid = int(re.search(r"^Uid:\s+(\d+)", status, re.M).group(1))
+            cgroup = Path(f"/proc/{pid}/cgroup").read_text()
+            system = "/system.slice/" in cgroup
+            unit = next((part for part in reversed(cgroup.strip().split("/"))
+                         if part.endswith((".service", ".scope"))), "unknown")
+        result.append((pid, uid, unit, system))
+    return result
+
+
+def is_ours(uid, unit):
+    return uid == os.getuid() and unit == SERVICE_NAME
+
+
+def listener_hint(uid, unit, system=False, pid="<pid>"):
+    if system:
+        return f"a system service ({unit}): sudo systemctl disable --now {shlex.quote(unit)}"
+    if uid != os.getuid():
+        return f"run by user id {uid} ({unit}): that user can stop it, or root with: sudo kill {pid}"
+    if "@autostart" in unit:
+        return f"an autostart entry ({unit}): turn it off in your desktop's startup settings"
+    if unit.endswith(".service"):
+        return f"in {unit}: systemctl --user disable --now {shlex.quote(unit)}"
+    return f"in {unit} (started by hand or at login): brscan-skey -t"
+
+
+def autostart_entries(dirs=None):
+    """Enabled autostart entries that start brscan-skey. A user entry with the same
+    file name overrides the system one."""
+    dirs = dirs or [Path("/etc/xdg/autostart"), XDG_CONFIG / "autostart"]
+    entries = {}
+    for d in dirs:  # later directories override earlier ones
+        for f in sorted(d.glob("*.desktop")) if d.is_dir() else []:
+            with contextlib.suppress(OSError):
+                entries[f.name] = (f, f.read_text(errors="replace"))
+    found = []
+    for f, text in entries.values():
+        exec_line = re.search(r"^Exec\s*=\s*(.*)$", text, re.M)
+        try:
+            argv = shlex.split(exec_line.group(1)) if exec_line else []
+        except ValueError:
+            argv = exec_line.group(1).split()
+        if not argv or os.path.basename(argv[0]) not in ("brscan-skey", "brscan-skey-exe") or "-t" in argv[1:]:
+            continue
+        if re.search(r"^Hidden\s*=\s*true", text, re.M | re.I) or \
+           re.search(r"^X-GNOME-Autostart-enabled\s*=\s*false", text, re.M | re.I):
+            continue
+        found.append(f)
+    return found
+
+
+def systemctl_user(*args):
+    return subprocess.run(["systemctl", "--user", *args], text=True, capture_output=True)
+
+
+def cmd_setup(a):
+    if os.geteuid() == 0:
+        print("Run setup as your normal user, without sudo. It asks for sudo itself when it needs it.")
+        return 1
+    missing = []
+    for c, hint in (
+        ("systemctl", "a systemd user session is required"),
+        ("sudo", "needed once, to point Brother's brscan-skey at this tool"),
+        ("scanimage", "Debian/Ubuntu sane-utils, Fedora/openSUSE sane-backends, Arch sane"),
+        ("naps2", "https://github.com/cyanfish/naps2/releases (.deb/.rpm; Arch: AUR naps2-bin). "
+                  "The Flatpak can't see Brother's driver."),
+    ):
+        if not shutil.which(c):
+            missing.append(f"  {c}: {hint}")
+    if not SKEY_EXE.exists():
+        missing.append("  brscan-skey: https://download.brother.com/welcome/dlf006652/brscan-skey-0.3.4-0.amd64.deb"
+                       " or https://download.brother.com/welcome/dlf006650/brscan-skey-0.3.4-0.x86_64.rpm")
+    if missing:
+        print("Missing requirements:\n" + "\n".join(missing))
+        return 1
+
+    configured = None
+    if CONFIG_FILE.exists():
+        try:
+            cfg = load_config()
+            validate_config(cfg)
+            configured = cfg.get("general", "profile")
+        except ScanError as e:
+            print(f"Fix the configuration first: {e}")
+            return 1
+
+    current = SKEY_CONFIG.read_text() if SKEY_CONFIG.exists() else ""
+    others = skey_other_users(current)
+    if others and not a.force:
+        print(f"{SKEY_CONFIG} points at another user's copy ({', '.join(others)}). "
+              "The file is shared by the whole system, so only one user can have the button. "
+              "Run setup with --force to take it over.")
+        return 1
+    other = [(pid, uid, unit, system) for pid, uid, unit, system in listeners() if not is_ours(uid, unit)]
+    auto = autostart_entries()
+    if other or auto:
+        print("Another brscan-skey listener is set up. With two, every press scans twice. Stop it first:")
+        for pid, uid, unit, system in other:
+            print(f"  pid {pid}: {listener_hint(uid, unit, system, pid)}")
+        for f in auto:
+            print(f"  autostart entry {f}: turn it off in your desktop's startup settings")
+        return 1
+
+    was_active = systemctl_user("is-active", SERVICE_NAME).stdout.strip() in ("active", "activating", "reloading")
+    systemctl_user("stop", SERVICE_NAME)  # scanimage can't query the scanner while the listener holds it
+    done = False
+    try:
+        done = _setup_steps(a, current, configured, others) == 0
+    finally:
+        if not done and was_active:
+            systemctl_user("start", SERVICE_NAME)
+            time.sleep(2)
+            if systemctl_user("is-active", SERVICE_NAME).stdout.strip() == "active":
+                print(f"Setup did not finish; {SERVICE_NAME} was restarted as it was.")
+            else:
+                print(f"Setup did not finish, and {SERVICE_NAME} did not start again. "
+                      f"See: journalctl --user -u {APP} -n 50")
+    return 0 if done else 1
+
+
+def _setup_steps(a, current_skey, configured, others):
+    time.sleep(1)
+    device = a.device or find_device()
+    if not device:
+        print("No Brother scanner found. Plug it in or press its button to wake it up, check that "
+              "`scanimage -L` lists it, and run setup again.")
+        return 1
+    print(f"Scanner: {device}")
+    try:
+        dev_opts = device_options(device)
+    except ScanError as e:
+        print(f"  {e}")
+        return 1
+
+    profile = a.profile or configured or DEFAULT_PROFILE
+    has_source = bool(dev_opts.get("source"))
+    source = "Feeder" if pick_source(dev_opts.get("source"), "Feeder") or not has_source else "Glass"
+    if not ensure_profile(profile, device, source):
+        return 1
+
+    INSTALL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if Path(__file__).resolve() != INSTALL_PATH.resolve():
+        tmp = INSTALL_PATH.with_name(f".{APP}.new")
+        shutil.copy2(__file__, tmp)
+        tmp.chmod(0o755)
+        os.replace(tmp, INSTALL_PATH)  # never a half-written tool
+    INSTALL_PATH.chmod(0o755)
+    print(f"  installed {INSTALL_PATH}")
+
+    supported = {k: v for k, v in PREFERRED_BACKEND_OPTIONS.items() if k in dev_opts}
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(CONFIG_TEMPLATE.format(
+            profile=profile, options=" ".join(f"{k}={v}" for k, v in supported.items()),
+            fallback=tilde(documents_dir() / "Scans" / "unsent")), encoding="utf-8")
+        print(f"  created {CONFIG_FILE} (scanner options: {supported or 'none'})")
+    elif profile != configured:
+        old = CONFIG_FILE.read_text(encoding="utf-8")
+        write_atomic(CONFIG_FILE, set_config_profile(old, profile))
+        try:
+            cfg = load_config()
+            validate_config(cfg)
+            if cfg.get("general", "profile") != profile:
+                raise ScanError("the profile line was not where expected")
+        except ScanError as e:
+            write_atomic(CONFIG_FILE, old)
+            print(f"  could not set the profile in {CONFIG_FILE} ({e}); edit it by hand")
+            return 1
+        print(f"  {CONFIG_FILE}: profile set to '{profile}'")
+    else:
+        print(f"  {CONFIG_FILE} already exists, left as is (profile '{profile}')")
+
+    new = rewrite_skey_config(current_skey, skey_command)
+    if new != current_skey:
+        print(f"  updating {SKEY_CONFIG} (sudo)")
+        if SKEY_CONFIG.exists() and not SKEY_ORIG.exists():
+            if subprocess.run(["sudo", "cp", "-p", str(SKEY_CONFIG), str(SKEY_ORIG)]).returncode != 0:
+                print(f"  could not back up {SKEY_CONFIG}; it was left unchanged")
+                return 1
+        fd, tmp = tempfile.mkstemp(prefix=f"{APP}-")
+        with os.fdopen(fd, "w") as f:
+            f.write(new)
+        r = subprocess.run(["sudo", "install", "-m", "644", tmp, str(SKEY_CONFIG)])
+        os.unlink(tmp)
+        if r.returncode != 0:
+            print(f"  could not update {SKEY_CONFIG}")
+            return 1
+    else:
+        print(f"  {SKEY_CONFIG} already points here")
+
+    SERVICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SERVICE_FILE.write_text(f"""[Unit]
+Description=Brother scanner button listener ({APP})
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+ExecStart={SKEY_EXE} -f
+Restart=always
+RestartSec=10
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target
+""")
+    systemctl_user("daemon-reload")
+    systemctl_user("reset-failed", SERVICE_NAME)
+    r = systemctl_user("enable", "--now", SERVICE_NAME)
+    time.sleep(5)
+    if systemctl_user("is-active", SERVICE_NAME).stdout.strip() != "active":
+        print(f"  {SERVICE_NAME} did not start: {r.stderr.strip()}\n"
+              f"  See: journalctl --user -u {APP} -n 50")
+        return 1
+    print(f"  started {SERVICE_NAME}")
+
+    notes = []
+    if others:
+        notes.append(f"The button was taken over from {', '.join(others)}. That user's listener service "
+                     "is still enabled and starts at their login; they should run uninstall.")
+    if len([1 for _, uid, _, _ in listeners() if uid == os.getuid()]) > 1:
+        notes.append("More than one brscan-skey listener is running; every press will scan twice.")
+    if not has_source:
+        notes.append("This scanner doesn't say whether it has a feeder. For a feeder, set max_pages "
+                     f"in {CONFIG_FILE} so that one press scans every page.")
+    if not shutil.which("notify-send"):
+        notes.append("notify-send is missing, so there will be no pop-ups; results go to the log only "
+                     "(package libnotify-bin, libnotify or libnotify-tools).")
+    if not shutil.which("gio"):
+        notes.append("gio is missing; Google Drive and network destinations won't work "
+                     "(package libglib2.0-bin, glib2 or glib2-tools).")
+    if str(INSTALL_PATH.parent) not in os.environ.get("PATH", "").split(":"):
+        notes.append(f"{INSTALL_PATH.parent} is not on your PATH; run commands as {INSTALL_PATH}.")
+    where = "on the glass" if source == "Glass" else ("in the feeder" if has_source else "in the scanner")
+    print(f"\nDone. Put a page {where} and press the scan button.\n"
+          f"Settings: NAPS2 -> Profiles -> \"{profile}\" (destination and format are under Auto Save).\n"
+          f"Log: {LOG_FILE}")
+    for n in notes:
+        print(f"Note: {n}")
+    return 0
+
+
+def cmd_uninstall(a):
+    if os.geteuid() == 0:
+        print("Run uninstall as your normal user, without sudo. It asks for sudo itself when it needs it.")
+        return 1
+    if shutil.which("systemctl"):
+        systemctl_user("disable", "--now", SERVICE_NAME)
+        if systemctl_user("is-active", SERVICE_NAME).stdout.strip() not in ("inactive", "failed"):
+            print(f"Could not stop {SERVICE_NAME}. Run uninstall from your desktop session; "
+                  "nothing was removed.")
+            return 1
+        SERVICE_FILE.unlink(missing_ok=True)
+        systemctl_user("daemon-reload")
+        print(f"Removed {SERVICE_NAME}.")
+    else:
+        print(f"systemctl not found; remove {SERVICE_FILE} by hand if it exists.")
+    text = SKEY_CONFIG.read_text() if SKEY_CONFIG.exists() else ""
+    others = skey_other_users(text)
+    if others:
+        print(f"{SKEY_CONFIG} belongs to another user's setup now ({', '.join(others)}); left as is.")
+    elif SKEY_ORIG.exists() and str(INSTALL_PATH) in text:
+        print(f"Restoring {SKEY_CONFIG} (sudo)")
+        if not shutil.which("sudo") or \
+           subprocess.run(["sudo", "cp", "-p", str(SKEY_ORIG), str(SKEY_CONFIG)]).returncode != 0:
+            print(f"Could not restore {SKEY_CONFIG}. The service is already removed; the file still "
+                  f"points at {INSTALL_PATH}, which is left in place so that it stays valid.")
+            return 1
+    elif str(INSTALL_PATH) in text:
+        print(f"No original of {SKEY_CONFIG} was kept; its button lines still point here. "
+              "Reinstall Brother's brscan-skey package to reset it.")
+    INSTALL_PATH.unlink(missing_ok=True)
+    print("Removed the tool. The scan button does nothing until a listener runs again "
+          "(Brother's own: run brscan-skey, or turn your brscan-skey autostart entry back on).")
+    print("Left in place:")
+    for p in (CONFIG_FILE.parent, LOG_FILE, LOCK_FILE, work_root(), HOME / f"{APP}-rescue",
+              NAPS2_PROFILES, Path(f"{NAPS2_PROFILES}.bak"), SKEY_ORIG):
+        if p.exists():
+            print(f"  {p}")
+    print("  your NAPS2 profile and any files in the fallback folder")
+    if work_root().is_dir() and any(work_root().glob("scan-*/page-*.png")):
+        print(f"  {work_root()} holds pages of an interrupted scan; move them somewhere safe")
+    return 0
+
+
+def cmd_status(a):
+    healthy = True
+    running = listeners()
+    if not shutil.which("systemctl"):
+        healthy = False
+        print("listener service: systemctl not found")
+    elif not SERVICE_FILE.exists():
+        healthy = False
+        print("listener service: not installed (run setup)")
+    else:
+        state = systemctl_user("is-active", SERVICE_NAME).stdout.strip()
+        healthy &= state == "active"
+        hint = ""
+        if state != "active" and not any(not is_ours(uid, unit) for _, uid, unit, _ in running):
+            hint = f"  (start it: systemctl --user reset-failed {APP}; systemctl --user start {APP})"
+        print(f"listener service: {state}{hint}")
+    print(f"brscan-skey listeners running: {len(running)}")
+    for pid, uid, unit, system in running:
+        print(f"  pid {pid}: {'this tool' if is_ours(uid, unit) else listener_hint(uid, unit, system, pid)}")
+    if len(running) != 1:
+        healthy = False
+    text = SKEY_CONFIG.read_text() if SKEY_CONFIG.exists() else ""
+    points = skey_points_here(text)
+    healthy &= points
+    print(f"{SKEY_CONFIG}: {'points here' if points else 'does NOT point here for every button (run setup again)'}")
+    tool_ok = os.access(INSTALL_PATH, os.X_OK)
+    healthy &= tool_ok
+    print(f"tool: {INSTALL_PATH} ({'ok' if tool_ok else 'MISSING'})")
+    try:
+        cfg = load_config()
+        validate_config(cfg)
+    except ScanError as e:
+        healthy = False
+        cfg = None
+        print(f"config: ERROR {e}")
+    if cfg is not None:
+        base_opts = parse_option_string(cfg.get("scanner", "options"))
+        actions = [None] + [act for act in ("image", "ocr", "email", "file")
+                            if cfg.get("general", f"profile_{act}", fallback="")]
+        for act in actions:
+            name = profile_for_action(cfg, act)
+            p = read_profile(name)
+            healthy &= p["found"]
+            print(f"profile{' for ' + act if act else ''}: {name} ({'found' if p['found'] else 'NOT FOUND, defaults used'})")
+            print(f"  output: {p['path']}")
+            print(f"  {p['dpi']} dpi, {p['bitdepth']}, source {p['source']}, {p['separator']}")
+            opts = dict(base_opts)
+            opts.update(p["options"])
+            print(f"  scanner options: {opts or 'none'}")
+    print(f"log: {LOG_FILE}")
+    if LOG_FILE.exists():
+        for line in LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]:
+            print("  " + line)
+    print(f"listener output: journalctl --user -u {APP} -n 50")
+    print("scanners known to brscan-skey: brscan-skey -l")
+    return 0 if healthy else 1
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog=APP, description="Scan button support for Brother scanners, configured with NAPS2.")
+    ap.add_argument("--version", action="version", version=f"{APP} {VERSION}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("scan", help="scan now (what the button runs)")
+    s.add_argument("--action", choices=["image", "ocr", "email", "file"], help="button function (set by brscan-skey)")
+    s.add_argument("--dry-run", action="store_true", help="print the scanimage command and the target, then exit")
+    s.add_argument("device", nargs="?", help="SANE device (default: first Brother scanner)")
+    s.add_argument("rest", nargs="*", help=argparse.SUPPRESS)  # extra args from brscan-skey
+    s.set_defaults(func=cmd_scan)
+
+    s = sub.add_parser("setup", help="install and configure")
+    s.add_argument("--profile", help=f"NAPS2 profile name (default: the configured one, or '{DEFAULT_PROFILE}')")
+    s.add_argument("--device", help="SANE device (default: first Brother scanner)")
+    s.add_argument("--force", action="store_true", help="take over brscan-skey.config from another user")
+    s.set_defaults(func=cmd_setup)
+
+    sub.add_parser("status", help="check the installation; exit status 1 if something is wrong").set_defaults(func=cmd_status)
+    sub.add_parser("uninstall", help="undo setup").set_defaults(func=cmd_uninstall)
+
+    a = ap.parse_args(argv)
+    return a.func(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
